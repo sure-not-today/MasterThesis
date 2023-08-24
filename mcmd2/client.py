@@ -1,8 +1,14 @@
 import asyncio
 from mavsdk import System
-from mavsdk.offboard import PositionNedYaw
 import argparse
 from dataclasses import dataclass
+import colorama
+import csv
+import time
+from mavsdk.telemetry import LandedState
+
+
+colorama.init()
 
 @dataclass
 class Position:
@@ -10,71 +16,100 @@ class Position:
     long: float
     alt: float
 
-class Drone(System):
-    def __init__(self, mavsdk_server_address=None, port=50051, sysid=245, compid=190, capacity = 100):
-      super().__init__(mavsdk_server_address, port, sysid, compid)
-      self.idle = True
-      self.payload = 0
-      self.capacity = capacity
+parser = argparse.ArgumentParser()
+parser.add_argument('-n', '--n', nargs='?', const=1, type=int, default=1)
+parser.add_argument('--log', action='store_true', help='Enable logging')
+args = parser.parse_args()
 
-    def get_idle(self):
-        return self.idle
+n = args.n - 1
+p1 = 50050 + n
+p2 = 14540 + n
+udp = f"udp://:{p2}"
 
-    def get_space(self):
-        return (self.capacity - self.payload)
+csvfile_path = f"dronelog{args.n}.csv"
+
+def get_space():
+    return (capacity - payload)
 
 async def get_position(drone):
+    global loc
+    global state
     position = await drone.telemetry.position().__aiter__().__anext__()
-    lat = round(position.latitude_deg, 4)
-    long = round(position.longitude_deg, 4)
+    state = await drone.telemetry.landed_state().__aiter__().__anext__()
+    lat = round(position.latitude_deg, 5)
+    long = round(position.longitude_deg, 5)
     alt = round(position.absolute_altitude_m, 1)
-    pos = Position(lat,long,alt)
-    return pos
+    loc = Position(lat,long,alt)
+    return loc
 
 async def send_status(drone, writer):
+    if args.log:
+        csvfile = open(csvfile_path, "w+", newline='')
+        csv_writer = csv.writer(csvfile)
     while True:
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.2)
         pos = await get_position(drone)
-        idle = drone.get_idle()
-        space = drone.get_space()
+
+        space = get_space()
         msg = f"STATUS_{pos.lat}_{pos.long}_{pos.alt}_{idle}_{space}"
         writer.write(msg.encode())
         await writer.drain()
+        if args.log:
+            current_time = time.strftime("%Y-%m-%d %H:%M:%S")
+            csv_writer.writerow([current_time, pos, idle, space])
 
-
-
-async def pos_reached(drone,pos):
+async def pos_reached(pos):
+    
+    lat = round(pos[0], 4)
+    long = round(pos[1], 4)
+    alt = round(pos[2], 1)
     while True:
-        position = await drone.telemetry.position().__aiter__().__anext__()
-        loc_lat = round(position.latitude_deg, 4)
-        loc_long = round(position.longitude_deg, 4)
-        loc_alt = round(position.absolute_altitude_m, 1)
-        lat = round(pos[0], 4)
-        long = round(pos[1], 4)
-        alt = round(pos[2], 1)
-        lat_reached = loc_lat==lat
-        long_reached = loc_long==long
-        alt_reached = loc_alt==alt
-        #print("from " + str(loc_lat) + " to " + str(lat) + ": " + str(lat_reached))
-        #print("from " + str(loc_long) + " to " + str(long) + ": " + str(long_reached))
-        #print("from " + str(loc_alt) + " to " + str(alt) + ": " + str(alt_reached))
+        global loc
+        lat_reached = round(loc.lat, 4)==lat
+        long_reached = round(loc.long, 4)==long
+        alt_reached = round(loc.alt, 4)==alt
+        if False:
+            print("from " + str(loc_lat) + " to " + str(lat) + ": " + str(lat_reached))
+            print("from " + str(loc_long) + " to " + str(long) + ": " + str(long_reached))
+            print("from " + str(loc_alt) + " to " + str(alt) + ": " + str(alt_reached))
         if lat_reached & long_reached & alt_reached:
+            print("Reached location.")
             return
         else:
             await asyncio.sleep(1)
 
+async def takeoff(drone):
+    await drone.action.arm()
+    print("Taking off...")
+    await drone.action.takeoff()
+    while (not (state == LandedState(2))):
+        await asyncio.sleep(1)
+
+async def goto(drone, pos):  
+    print("Goto...")
+    await drone.action.goto_location(*pos, 0)
+    await pos_reached(pos)
+
+async def land(drone):
+    print("Landing...")
+    await drone.action.land()
+    while (not (state == LandedState(1))):
+        await asyncio.sleep(1)
+    await drone.action.disarm()
+
 async def main():
     global idle
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-n', '--n', nargs='?', const=1, type=int, default=1)
-    args = parser.parse_args()
-    
-    n = args.n - 1
-    p1 = 50050 + n
-    p2 = 14540 + n
-    udp = f"udp://:{p2}"
+    global payload
+    global capacity
+    global loc
+    global state
+    idle = True
+    payload = 0
+    capacity = 200
+    loc = Position(0,0,0)
+    state = LandedState(0)
 
-    drone = Drone(port=p1)
+    drone = System(port=p1)
     await drone.connect(system_address=udp)
 
     home = [47.39728341067808, 8.542641053423798, 500]
@@ -91,61 +126,47 @@ async def main():
             print("-- Global position state is good enough for flying.")
             break
 
-    try:
-        reader, writer = await asyncio.open_connection('127.0.0.1', 8888)
-        print("Connected to server.")
-        
-        await drone.action.arm()
-        await asyncio.sleep(1)
-        await drone.action.takeoff()
-        await asyncio.sleep(2)
 
-        task = asyncio.create_task(send_status(drone, writer))
+    reader, writer = await asyncio.open_connection('127.0.0.1', 8888)
+    print(f"{colorama.Fore.GREEN}Connected to server.{colorama.Style.RESET_ALL}")
+    
+    task = asyncio.create_task(send_status(drone, writer))
 
-        await asyncio.sleep(7)
+    while True:
+        print("Waiting to receive task from server")
+        msg = await reader.read(1024)
+        message = msg.decode()
+        print(message)
 
-        drone.idle = False
+        if message.startswith("EMPTY"):
+            idle = False
+            print("Received task to empty container")
+            _ , lat, long, alt = message.split("_")
+            pos = [float(lat),float(long),float(alt)]
 
-        while True:
-            print("waiting to receive task from server")
-            msg = await reader.read(1024)
-            message = msg.decode()
-            print(message)
+            await takeoff(drone)
+            await goto(drone, pos)
+            await land(drone)
 
-            if message.startswith("EMPTY"):
-                drone.idle = False
-                print("received task to empty container")
-                _ , lat, long, alt = message.split("_")
-                pos = [float(lat),float(long),float(alt)]
-                print("going to location")
-                await drone.action.goto_location(*pos, 0)
-                await pos_reached(drone, pos)
-                print("reached container and now emptying")
-                msg = f"REACHED_{pos[0]}_{pos[1]}_{pos[2]}"
-                writer.write(msg.encode())
-                await writer.drain()
+            msg = f"REACHED_{pos[0]}_{pos[1]}_{pos[2]}"
+            writer.write(msg.encode())
+            await writer.drain()
 
-            elif message.startswith("PAYLOAD"):
-                _ , received_payload = message.split("_")
-                print(f"Received {received_payload} units of Payload")
-                payload += received_payload
+        elif message.startswith("PAYLOAD"):
+            _ , received_payload = message.split("_")
+            print(f"Received {received_payload} units of Payload")
+            payload += int(received_payload)
 
-                if payload > 0.8*drone.capacity:
-                    print("returning home")
-                    await drone.action.goto_location(*home, 0)
-                    await pos_reached(drone, home)
-                    await asyncio.sleep(5)
-                    drone.payload = 0
-                drone.idle = True
-
-
-    except (ConnectionRefusedError, OSError):
-        print("Connection to server failed. Make sure the server is running.")
-    finally:
-        # Close the connection when done
-        writer.close()
-        await writer.wait_closed()
-        print("Connection closed.")
+            if payload > 0.8*capacity:
+                print("Returning home")
+                await takeoff(drone)
+                await goto(drone, home)
+                await land(drone)
+                await asyncio.sleep(5)
+                print("Setting payload to zero")
+                payload = 0
+            print("Setting idle")
+            idle = True
 
 if __name__ == "__main__":
     asyncio.run(main())

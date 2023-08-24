@@ -3,6 +3,10 @@ import pickle
 from mavsdk import System
 from mavsdk.offboard import PositionNedYaw
 import argparse
+import warnings
+
+warnings.filterwarnings("ignore", category=RuntimeWarning, message="cannot join current thread")
+
 
 async def pos_reached(drone,pos):
     while True:
@@ -97,4 +101,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
