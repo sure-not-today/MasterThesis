@@ -52,8 +52,13 @@ class Drone:
         self.space = 0
         self.atcont = None
 
-    def stop(self):
-        print("PLACEHOLDER FOR STOPPING DRONE")
+    async def stop(self):
+        self.writer.write("STOP".encode())
+        await self.writer.drain()
+
+    async def pause(self):
+        self.writer.write("PAUSE".encode())
+        await self.writer.drain()
 
 def equal_position(pos1: Position, pos2: Position) -> bool:
     latb = round(pos1.lat,4) == round(pos2.lat,4)
@@ -141,9 +146,11 @@ async def handle_client(reader, writer):
                 sconts[name].new_data(data)
             else:
                 print(f"Received: {message!r} from {addr!r}")
+                break
     except asyncio.CancelledError:
         pass
     finally:
+        print(f"{colorama.Fore.CYAN}{addr} disconnected!{colorama.Style.RESET_ALL}")
         del drones[addr]
         writer.close()
 
@@ -216,8 +223,14 @@ def get_crit_container3():
     return crit_c
 
 
-async def empty_cmd(container: SContainer):
-    pass
+def compare_dict_keys(dict1, dict2):
+    # Find keys unique to dict1
+    keys_only_in_dict1 = set(dict1.keys()) - set(dict2.keys())
+    
+    # Find keys unique to dict2
+    keys_only_in_dict2 = set(dict2.keys()) - set(dict1.keys())
+    
+    return (keys_only_in_dict1, keys_only_in_dict2)
 
 async def gui():
     root = tk.Tk()
@@ -290,47 +303,43 @@ async def gui():
         indicators[i] = indicator
 
     # DRONES
-
-    idleD = {}
-
-
     tk.Label(frame_D, text="Drones").pack()
 
-
     try:
-        droner = []
-        id = 0
+        clients_gui = {}
         drone_labels = {}
         drone_progress_bars = {}
         drone_indicators = {}
         while True:
-            for drone in drones.values():
-                if drone not in droner:
-                    droner.append(drone)
+            add_to_gui, remove_from_gui = compare_dict_keys(drones, clients_gui)
+            for addr in add_to_gui:
+                drone = drones[addr]
+                frame = tk.Frame(frame_D)
+                frame.pack()
 
-                    frame_D_i = tk.Frame(frame_D)
-                    frame_D_i.pack()
+                label = tk.Label(frame, text=f"{drone.name} Space: {drone.space}")
+                label.grid(row=0, column=0, padx=10)
 
-                    label = tk.Label(frame_D_i, text=f"{drone.name} Space: {drone.space}")
-                    label.grid(row=0, column=0, padx=10)
+                progress_bar = ttk.Progressbar(frame, orient="horizontal", mode="determinate", length=200)
+                progress_bar.grid(row=1, column=0, padx=10, pady=10)
 
-                    progress_bar = ttk.Progressbar(frame_D_i, orient="horizontal", mode="determinate", length=200)
-                    progress_bar.grid(row=1, column=0, padx=10, pady=10)
+                indicator_label = tk.Label(frame, text=f"{drone.name} Status:")
+                indicator_label.grid(row=0, column=1, padx=10)
 
-                    indicator_label = tk.Label(frame_D_i, text=f"{drone.name} Status:")
-                    indicator_label.grid(row=0, column=1, padx=10)
+                indicator = tk.Label(frame, text="Idle", bg="green", width=10)
+                indicator.grid(row=1, column=1, padx=10, pady=10)
 
-                    indicator = tk.Label(frame_D_i, text="Idle", bg="green", width=10)
-                    indicator.grid(row=1, column=1, padx=10, pady=10)
+                stop_button = tk.Button(frame, text="STOP", command=lambda: asyncio.create_task(drone.stop()))
+                stop_button.grid(row=0, column=2, rowspan=2, padx=10)
 
-                    stop_button = tk.Button(frame_D_i, text="STOP", command=drone.stop)
-                    stop_button.grid(row=0, column=2, rowspan=2, padx=10)
+                pause_button = tk.Button(frame, text="PAUSE", command=lambda: asyncio.create_task(drone.pause()))
+                pause_button.grid(row=0, column=3, rowspan=2, padx=10)
 
-                    drone_labels[id] = label
-                    drone_progress_bars[id] = progress_bar
-                    drone_indicators[id] = indicator
+                clients_gui[addr] = (frame, label, progress_bar, indicator, stop_button)
 
-                    id += 1
+            for addr in remove_from_gui:
+                frame, _, _, _, _= clients_gui.pop(addr)
+                frame.pack_forget()
 
             for i, container in enumerate(containers):
                 real_label[i]["text"] = f"{container.name} Amount: {container.amount} / {container.capacity}"
@@ -353,14 +362,18 @@ async def gui():
                     indicators[i]["text"] = "Filling"
                     indicators[i]["bg"] = "green"
 
-            for i, drone in enumerate(drones.values()):
-                drone_labels[i]["text"] = f"{drone.name} Space: {drone.space}"
+            for addr in clients_gui:
+                _ , label, _, indicator, button = clients_gui[addr]
+                drone = drones[addr]
+                label["text"] = f"{drone.name} Space: {drone.space}"
                 if drone.idle:
-                    drone_indicators[i]["text"] = "Idle"
-                    drone_indicators[i]["bg"] = "green"
+                    indicator["text"] = "Idle"
+                    indicator["bg"] = "green"
                 else:
-                    drone_indicators[i]["text"] = "Busy"
-                    drone_indicators[i]["bg"] = "red"                   
+                    indicator["text"] = "Busy"
+                    indicator["bg"] = "red"   
+
+                button["command"] = lambda: asyncio.create_task(drone.stop())              
 
             root.update()  # Update the GUI
             await asyncio.sleep(0.01)  # Yield control to asyncio event loop

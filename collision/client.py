@@ -9,6 +9,7 @@ from mavsdk.telemetry import LandedState
 
 
 colorama.init()
+queue = asyncio.Queue()
 
 @dataclass
 class Position:
@@ -24,6 +25,10 @@ class Status:
     payload: float
     capacity: float
     landed_state: LandedState
+
+class PausableTask():
+    def __init__(self, pause_event) -> None:
+        pass
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-n', '--n', nargs='?', const=1, type=int, default=1)
@@ -58,8 +63,7 @@ async def status_update(drone, writer):
         status.landed_state = await drone.telemetry.landed_state().__aiter__().__anext__()
         space = status.capacity - status.payload
         msg = f"STATUS_{status.pos.lat}_{status.pos.long}_{status.pos.alt}_{status.idle}_{space}"
-        writer.write(msg.encode())
-        await writer.drain()
+        await queue.put(msg)
         if args.log:
             current_time = time.strftime("%Y-%m-%d %H:%M:%S")
             csv_writer.writerow([current_time, status.pos, status.idle, status.payload])
@@ -97,6 +101,43 @@ async def land(drone):
         await asyncio.sleep(1)
     await drone.action.disarm()
 
+async def move_to(drone):
+    lat_reached = approx_same(status.pos.lat, status.goal.lat, 1e-5)
+    long_reached = approx_same(status.pos.long, status.goal.long, 1e-5)
+    if lat_reached & long_reached:
+        print("Already there")
+    else:
+        await takeoff(drone)
+        await goto(drone, status.goal)
+        await land(drone)
+
+    msg = f"REACHED_{status.goal.lat}_{status.goal.long}_{status.goal.alt}"
+    await queue.put(msg)
+    status.goal = None
+
+async def return_home(drone):
+    if status.payload > 0.8*status.capacity:
+        print("Returning home")
+        await takeoff(drone)
+        await goto(drone, home)
+        await land(drone)
+        await asyncio.sleep(5)
+        print("Setting payload to zero")
+        status.payload = 0
+
+    print("Setting idle")
+    status.idle = True
+
+async def send_msg(writer, msg):
+    writer.write(msg.encode())
+    await writer.drain()
+
+async def writing(writer):
+    while True:
+        msg = await queue.get()
+        await send_msg(writer, msg)
+        await asyncio.sleep(0)
+
 async def main():
 
     global status
@@ -105,7 +146,8 @@ async def main():
     drone = System(port=p1)
     await drone.connect(system_address=udp)
 
-    home =Position(47.39728341067808, 8.542641053423798, 500)
+    global home
+    home = Position(47.39728341067808, 8.542641053423798, 500)
     
 
     print("Waiting for drone to connect...")
@@ -123,10 +165,14 @@ async def main():
     reader, writer = await asyncio.open_connection('127.0.0.1', 8888)
     print(f"{colorama.Fore.GREEN}Connected to server.{colorama.Style.RESET_ALL}")
     
-    task = asyncio.create_task(status_update(drone, writer))
+    task_status = asyncio.create_task(status_update(drone, writer))
+    task_writer = asyncio.create_task(writing(writer))
     drone_name = chr(ord('A') + n)
     print(f"Hello I am Drone {drone_name}")
     await asyncio.sleep(2)
+
+    current_task = None
+
     while True:
         msg = await reader.read(1024)
         message = msg.decode()
@@ -134,23 +180,13 @@ async def main():
         if message.startswith("EMPTY"):
             t0 = asyncio.get_event_loop().time()
             status.idle = False
-            await asyncio.sleep(0.02)
             print("Received task to empty container")
             _ , lat, long, alt = message.split("_")
             status.goal = Position(float(lat), float(long), float(alt))
 
-            lat_reached = approx_same(status.pos.lat, status.goal.lat, 1e-5)
-            long_reached = approx_same(status.pos.long, status.goal.long, 1e-5)
-            if lat_reached & long_reached:
-                print("Already there")
-            else:
-                await takeoff(drone)
-                await goto(drone, status.goal)
-                await land(drone)
+            current_task = asyncio.create_task(move_to(drone), name="move")
 
-            msg = f"REACHED_{status.goal.lat}_{status.goal.long}_{status.goal.alt}"
-            writer.write(msg.encode())
-            await writer.drain()
+            
 
         elif message.startswith("PAYLOAD"):
             _ , amount, penalty, received_payload, name = message.split("_")           
@@ -159,24 +195,27 @@ async def main():
             time = round(te-t0, 1)
             print(f"Received {received_payload} units of Payload after {time} seconds from Container {name}")
             msg = f"INFO_{time}_{amount}_{penalty}_{received_payload}_{name}"
-            writer.write(msg.encode())
-            await writer.drain()
+            await queue.put(msg)
             
-                       
-
-            if status.payload > 0.8*status.capacity:
-                print("Returning home")
-                await takeoff(drone)
-                await goto(drone, home)
-                await land(drone)
-                await asyncio.sleep(5)
-                print("Setting payload to zero")
-                status.payload = 0
-
-            print("Setting idle")
-            status.idle = True
+            current_task = asyncio.create_task(return_home(drone), name="home")
         
-        await asyncio.sleep(.01)
+        elif message.startswith("PAUSE"):
+            task_name = None
+            if current_task:
+                current_task.cancel()
+                await drone.action.hold()
+                task_name = current_task.get_name()
+            await asyncio.sleep(10)
+            if task_name == "move":
+                current_task = asyncio.create_task(move_to(drone))
+            elif task_name == "home":
+                current_task = asyncio.create_task(return_home(drone))
+        
+        elif message.startswith("STOP"):
+            await land(drone)
+            break
+        
+        await asyncio.sleep(0)
 
 if __name__ == "__main__":
     asyncio.run(main())

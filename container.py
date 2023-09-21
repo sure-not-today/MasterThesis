@@ -110,6 +110,7 @@ class SContainer(Container):
         self.d = RecursiveMean() # time to empty
         self.pending = False
         self.capped = False
+        self.locked = False
 
         asyncio.create_task(self.fill())
     
@@ -125,6 +126,11 @@ class SContainer(Container):
                 print(f"\n")
             await asyncio.sleep(1)
     
+    async def lock(self):
+        self.locked = True
+        await asyncio.sleep(10*self.n)
+        self.locked = False
+    
     def new_data(self, data):
         self.n += 1
         t, a, p, r, d = data
@@ -136,9 +142,12 @@ class SContainer(Container):
             aps = (a - ap + p - pp + r) / (t - tp)
             self.aps.mean(aps)
             
-        if p > 0 and not self.capped:
-            self.capped = True
-            self.capacity = a+r
+        if not self.capped:        
+            if p > 0:
+                self.capped = True
+                self.capacity = a+r
+            else:
+                asyncio.create_task(self.lock())
             
         self.threshold = self.capacity - (self.aps()*self.d())
         
